@@ -1,0 +1,514 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+<title>X-Ray Hand Tracker</title>
+<style>
+  :root{
+    --bg:#000;
+    --accent-blue:#1a4dff;
+    --accent-cyan:#00e5ff;
+    --accent-green:#39ff88;
+  }
+  *{box-sizing:border-box;}
+  html,body{
+    margin:0; padding:0; width:100%; height:100%;
+    background:var(--bg);
+    overflow:hidden;
+    font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  #app{
+    position:fixed; inset:0;
+    background:#000;
+    display:flex; align-items:center; justify-content:center;
+  }
+  #stage{
+    position:relative;
+    display:flex; align-items:center; justify-content:center;
+    overflow:hidden;
+  }
+  #stageContent{
+    position:relative;
+    width:100%; height:100%;
+    transform: scaleX(-1); /* single mirror flip for the whole visual stack */
+  }
+  video#hiddenVideo{
+    position:absolute; opacity:0; pointer-events:none; width:1px; height:1px;
+  }
+  video#bgVideo{
+    position:absolute; inset:0; width:100%; height:100%;
+    object-fit:cover;
+    filter:brightness(0.55) saturate(0.9);
+  }
+  canvas#glCanvas, canvas#overlayCanvas{
+    position:absolute; inset:0; width:100%; height:100%;
+    pointer-events:none;
+  }
+  canvas#glCanvas{ z-index:10; }
+  canvas#overlayCanvas{ z-index:20; }
+  svg#quadSvg{
+    position:absolute; inset:0; width:100%; height:100%;
+    pointer-events:none; z-index:20;
+    overflow:visible;
+  }
+  .marker{
+    position:absolute; width:10px; height:10px; margin:-5px 0 0 -5px;
+    border-radius:50%;
+    background:var(--accent-green);
+    box-shadow:0 0 6px 2px var(--accent-green), 0 0 14px 4px rgba(57,255,136,0.5);
+    z-index:20; pointer-events:none;
+  }
+  #modeLabel{
+    position:absolute; top:18px; left:50%; transform:translateX(-50%) scaleX(-1);
+    z-index:25; color:rgba(255,255,255,0.75);
+    font-size:12px; letter-spacing:0.25em; text-transform:uppercase;
+    padding:6px 14px; border:1px solid rgba(255,255,255,0.2);
+    border-radius:999px; background:rgba(0,0,0,0.35);
+    backdrop-filter:blur(6px);
+    pointer-events:none;
+  }
+  #loading{
+    position:absolute; inset:0; z-index:30;
+    display:flex; align-items:center; justify-content:center;
+    color:#cfe6ff; background:rgba(0,0,0,0.92);
+    font-size:16px; letter-spacing:0.08em;
+    text-align:center; padding:24px;
+  }
+  #loading.hidden{ display:none; }
+  #errorBox{
+    position:absolute; inset:0; z-index:40;
+    display:none; align-items:center; justify-content:center;
+    color:#ff9d9d; background:rgba(0,0,0,0.95);
+    font-size:14px; text-align:center; padding:32px; line-height:1.6;
+  }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <div id="stageContent">
+      <video id="bgVideo" autoplay playsinline muted></video>
+      <canvas id="glCanvas"></canvas>
+      <canvas id="overlayCanvas"></canvas>
+      <svg id="quadSvg"><polygon id="quadPoly" points="" fill="none" stroke="rgba(57,255,136,0.85)" stroke-width="1.5" style="filter:drop-shadow(0 0 6px rgba(57,255,136,0.6));"/></svg>
+      <div class="marker" id="mTL"></div>
+      <div class="marker" id="mTR"></div>
+      <div class="marker" id="mBL"></div>
+      <div class="marker" id="mBR"></div>
+    </div>
+    <div id="modeLabel">Particle Mode</div>
+  </div>
+  <video id="hiddenVideo" autoplay playsinline muted></video>
+  <div id="loading">Loading AI Models &amp; Camera...</div>
+  <div id="errorBox"></div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.163.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module">
+import * as THREE from "three";
+import { FilesetResolver, HandLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.34/vision_bundle.mjs";
+
+const hiddenVideo = document.getElementById('hiddenVideo');
+const bgVideo = document.getElementById('bgVideo');
+const stage = document.getElementById('stage');
+const glCanvas = document.getElementById('glCanvas');
+const overlayCanvas = document.getElementById('overlayCanvas');
+const overlayCtx = overlayCanvas.getContext('2d');
+const loading = document.getElementById('loading');
+const errorBox = document.getElementById('errorBox');
+const quadPoly = document.getElementById('quadPoly');
+const modeLabel = document.getElementById('modeLabel');
+const markerEls = {
+  TL: document.getElementById('mTL'),
+  TR: document.getElementById('mTR'),
+  BL: document.getElementById('mBL'),
+  BR: document.getElementById('mBR'),
+};
+
+const HAND_CONNECTIONS = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],
+  [13,17],[17,18],[18,19],[19,20],
+  [0,17]
+];
+
+let videoAspect = 16/9;
+let handLandmarker = null;
+let renderer, scene, camera, mesh, material, videoTexture;
+let clock = new THREE.Clock();
+let rafId = null;
+let lastVideoTime = -1;
+let stream = null;
+
+// Normalized (0..1, y-down) quad points: TL, TR, BL, BR
+let pointsRef = [
+  { x: 0.32, y: 0.32 },
+  { x: 0.68, y: 0.32 },
+  { x: 0.32, y: 0.68 },
+  { x: 0.68, y: 0.68 },
+];
+let effectModeRef = 'particle';
+
+const VERT_SHADER = `
+varying vec2 vUv;
+void main() {
+  vUv = uv;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`;
+
+const FRAG_SHADER = `
+precision highp float;
+varying vec2 vUv;
+uniform sampler2D tDiffuse;
+uniform vec2 resolution;
+uniform float time;
+uniform float uMode;
+
+float hash(vec2 p){
+  return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453123);
+}
+
+float luma(vec3 c){
+  return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+vec3 particleEffect(vec2 uv, float brightness){
+  float bands = 20.0;
+  float contour = fract(brightness * bands - time * 0.5);
+  contour = smoothstep(0.0, 0.08, contour) - smoothstep(0.08, 0.16, contour);
+  vec3 contourColor = vec3(0.05, 0.3, 0.9) * contour * 1.5;
+
+  float gridSize = 90.0;
+  vec2 cell = floor(uv * gridSize);
+  vec2 cellUv = fract(uv * gridSize);
+  vec2 cellCenterUv = (cell + 0.5) / gridSize;
+  vec3 cellColor = texture2D(tDiffuse, cellCenterUv).rgb;
+  float cellBrightness = luma(cellColor);
+
+  float phase = hash(cell);
+  float strobe = 0.5 + 0.5 * sin(time * 15.0 + phase * 6.2831);
+
+  float cyclePos = fract(time * 5.0 + phase);
+  vec3 c1 = vec3(1.0, 0.2, 0.6);
+  vec3 c2 = vec3(1.0, 0.9, 0.2);
+  vec3 c3 = vec3(1.0, 1.0, 1.0);
+  vec3 particleColor;
+  if (cyclePos < 0.333) particleColor = mix(c1, c2, cyclePos / 0.333);
+  else if (cyclePos < 0.666) particleColor = mix(c2, c3, (cyclePos - 0.333) / 0.333);
+  else particleColor = mix(c3, c1, (cyclePos - 0.666) / 0.334);
+
+  float d = max(abs(cellUv.x - 0.5), abs(cellUv.y - 0.5));
+  float squareMask = 1.0 - smoothstep(0.32, 0.44, d);
+
+  float edgeStrength = smoothstep(0.15, 0.6, cellBrightness) * strobe;
+  vec3 particles = particleColor * squareMask * edgeStrength;
+
+  vec3 glow = vec3(0.1, 0.3, 0.9) * smoothstep(0.2, 0.8, brightness) * 0.6;
+
+  return contourColor + particles + glow;
+}
+
+vec3 xrayEffect(vec2 uv, float brightness){
+  vec3 baseBlue = vec3(0.05, 0.15, 0.45);
+  vec3 darkBlue = vec3(0.55, 0.75, 1.0);
+  float faceMask = smoothstep(0.3, 0.9, brightness);
+  vec3 base = mix(darkBlue, baseBlue, faceMask);
+
+  vec2 texel = 1.0 / resolution;
+  float tl = luma(texture2D(tDiffuse, uv + vec2(-texel.x,  texel.y)).rgb);
+  float t  = luma(texture2D(tDiffuse, uv + vec2( 0.0,       texel.y)).rgb);
+  float tr = luma(texture2D(tDiffuse, uv + vec2( texel.x,   texel.y)).rgb);
+  float l  = luma(texture2D(tDiffuse, uv + vec2(-texel.x,   0.0)).rgb);
+  float r  = luma(texture2D(tDiffuse, uv + vec2( texel.x,   0.0)).rgb);
+  float bl = luma(texture2D(tDiffuse, uv + vec2(-texel.x, -texel.y)).rgb);
+  float b  = luma(texture2D(tDiffuse, uv + vec2( 0.0,      -texel.y)).rgb);
+  float br = luma(texture2D(tDiffuse, uv + vec2( texel.x, -texel.y)).rgb);
+
+  float edgeX = -tl - 2.0 * l - bl + tr + 2.0 * r + br;
+  float edgeY = -tl - 2.0 * t - tr + bl + 2.0 * b + br;
+  float edgeMag = sqrt(edgeX * edgeX + edgeY * edgeY);
+  vec3 edgeColor = vec3(0.0, 0.9, 1.0) * edgeMag * 2.0;
+
+  float noise = (hash(uv * resolution + time * 100.0) - 0.5) * 0.1;
+  float scan = sin(uv.y * resolution.y * 2.0) * 0.05;
+
+  return base + edgeColor + noise - scan;
+}
+
+void main(){
+  vec2 uv = vUv;
+  vec3 videoColor = texture2D(tDiffuse, uv).rgb;
+  float brightness = luma(videoColor);
+
+  vec3 particleFinal = particleEffect(uv, brightness);
+  vec3 xrayFinal = xrayEffect(uv, brightness);
+
+  vec3 finalColor = mix(particleFinal, xrayFinal, uMode);
+  gl_FragColor = vec4(finalColor, 0.95);
+}
+`;
+
+function showError(msg){
+  loading.classList.add('hidden');
+  errorBox.style.display = 'flex';
+  errorBox.textContent = msg;
+}
+
+function handleResize(){
+  const windowAspect = window.innerWidth / window.innerHeight;
+  if (windowAspect > videoAspect) {
+    stage.style.width = `${window.innerHeight * videoAspect}px`;
+    stage.style.height = '100%';
+  } else {
+    stage.style.width = '100%';
+    stage.style.height = `${window.innerWidth / videoAspect}px`;
+  }
+  if (renderer) {
+    const rect = stage.getBoundingClientRect();
+    renderer.setSize(rect.width, rect.height, false);
+  }
+  overlayCanvas.width = stage.clientWidth;
+  overlayCanvas.height = stage.clientHeight;
+}
+
+function initThree(){
+  renderer = new THREE.WebGLRenderer({ canvas: glCanvas, alpha: true, antialias: true });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+  scene = new THREE.Scene();
+  camera = new THREE.OrthographicCamera(0, 1, 1, 0, -1, 1);
+  camera.position.z = 1;
+
+  videoTexture = new THREE.VideoTexture(hiddenVideo);
+  videoTexture.minFilter = THREE.LinearFilter;
+  videoTexture.magFilter = THREE.LinearFilter;
+  videoTexture.generateMipmaps = false;
+
+  const geo = new THREE.PlaneGeometry(1, 1, 32, 32);
+  material = new THREE.ShaderMaterial({
+    uniforms: {
+      tDiffuse: { value: videoTexture },
+      resolution: { value: new THREE.Vector2(hiddenVideo.videoWidth || 1280, hiddenVideo.videoHeight || 720) },
+      time: { value: 0 },
+      uMode: { value: 0 },
+    },
+    vertexShader: VERT_SHADER,
+    fragmentShader: FRAG_SHADER,
+    transparent: true,
+    side: THREE.DoubleSide,
+  });
+  mesh = new THREE.Mesh(geo, material);
+  scene.add(mesh);
+
+  handleResize();
+}
+
+function lerpPoint(a, b, t){
+  return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t };
+}
+
+function updateGeometry(){
+  const geo = mesh.geometry;
+  const posAttr = geo.attributes.position;
+  const uvAttr = geo.attributes.uv;
+  const segs = 32;
+  const [TL, TR, BL, BR] = pointsRef;
+
+  for (let iy = 0; iy <= segs; iy++) {
+    const v = iy / segs; // 0 = bottom row, 1 = top row
+    const left = lerpPoint(BL, TL, v);
+    const right = lerpPoint(BR, TR, v);
+    for (let ix = 0; ix <= segs; ix++) {
+      const u = ix / segs;
+      const idx = iy * (segs + 1) + ix;
+      const screenPt = lerpPoint(left, right, u); // normalized 0..1, y-down
+      posAttr.setXYZ(idx, screenPt.x, 1 - screenPt.y, 0);
+      uvAttr.setXY(idx, screenPt.x, 1 - screenPt.y);
+    }
+  }
+  posAttr.needsUpdate = true;
+  uvAttr.needsUpdate = true;
+}
+
+function updateQuadOverlay(){
+  const w = stage.clientWidth, h = stage.clientHeight;
+  const [TL, TR, BL, BR] = pointsRef;
+  const pts = [TL, TR, BR, BL].map(p => `${p.x * w},${p.y * h}`).join(' ');
+  quadPoly.setAttribute('points', pts);
+
+  markerEls.TL.style.left = `${TL.x * w}px`; markerEls.TL.style.top = `${TL.y * h}px`;
+  markerEls.TR.style.left = `${TR.x * w}px`; markerEls.TR.style.top = `${TR.y * h}px`;
+  markerEls.BL.style.left = `${BL.x * w}px`; markerEls.BL.style.top = `${BL.y * h}px`;
+  markerEls.BR.style.left = `${BR.x * w}px`; markerEls.BR.style.top = `${BR.y * h}px`;
+}
+
+function isPinching(hand){
+  const dx = hand[8].x - hand[4].x;
+  const dy = hand[8].y - hand[4].y;
+  return Math.sqrt(dx * dx + dy * dy) < 0.20;
+}
+
+function drawSkeleton(landmarksList){
+  const ctx = overlayCtx;
+  ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+  const w = overlayCanvas.width, h = overlayCanvas.height;
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.4)';
+  ctx.lineWidth = 1;
+  ctx.shadowColor = 'rgba(255,255,255,0.5)';
+  ctx.shadowBlur = 3;
+
+  for (const hand of landmarksList) {
+    for (const [a, b] of HAND_CONNECTIONS) {
+      const pa = hand[a], pb = hand[b];
+      ctx.beginPath();
+      ctx.moveTo(pa.x * w, pa.y * h);
+      ctx.lineTo(pb.x * w, pb.y * h);
+      ctx.stroke();
+    }
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    for (const p of hand) {
+      ctx.beginPath();
+      ctx.arc(p.x * w, p.y * h, 1.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+}
+
+function updateWindowFromHands(landmarksList){
+  if (landmarksList.length >= 2) {
+    const handA = landmarksList[0];
+    const handB = landmarksList[1];
+    const pinchA = isPinching(handA);
+    const pinchB = isPinching(handB);
+
+    if (pinchA && pinchB) {
+      effectModeRef = 'xray';
+      const centerA = { x: (handA[8].x + handA[4].x) / 2, y: (handA[8].y + handA[4].y) / 2 };
+      const centerB = { x: (handB[8].x + handB[4].x) / 2, y: (handB[8].y + handB[4].y) / 2 };
+      const left = centerA.x < centerB.x ? centerA : centerB;
+      const right = centerA.x < centerB.x ? centerB : centerA;
+      const offset = 0.075;
+      pointsRef = [
+        { x: left.x, y: left.y - offset },
+        { x: right.x, y: right.y - offset },
+        { x: left.x, y: left.y + offset },
+        { x: right.x, y: right.y + offset },
+      ];
+    } else {
+      effectModeRef = 'particle';
+      buildParticleWindow(handA, handB);
+    }
+  } else if (landmarksList.length === 1) {
+    effectModeRef = 'particle';
+    buildParticleWindow(landmarksList[0], landmarksList[0]);
+  }
+  modeLabel.textContent = effectModeRef === 'xray' ? 'X-Ray Mode' : 'Particle Mode';
+}
+
+function buildParticleWindow(handA, handB){
+  const indexA = handA[8], thumbA = handA[4];
+  const indexB = handB[8], thumbB = handB[4];
+  const leftIsA = indexA.x < indexB.x;
+  const iL = leftIsA ? indexA : indexB;
+  const iR = leftIsA ? indexB : indexA;
+  const tL = leftIsA ? thumbA : thumbB;
+  const tR = leftIsA ? thumbB : thumbA;
+  pointsRef = [
+    { x: iL.x, y: iL.y },
+    { x: iR.x, y: iR.y },
+    { x: tL.x, y: tL.y },
+    { x: tR.x, y: tR.y },
+  ];
+}
+
+function detectLoop(){
+  rafId = requestAnimationFrame(detectLoop);
+  if (hiddenVideo.readyState < 2) return;
+
+  const now = performance.now();
+  if (hiddenVideo.currentTime !== lastVideoTime && handLandmarker) {
+    lastVideoTime = hiddenVideo.currentTime;
+    const result = handLandmarker.detectForVideo(hiddenVideo, now);
+    const landmarksList = result.landmarks || [];
+    drawSkeleton(landmarksList);
+    updateWindowFromHands(landmarksList);
+    updateQuadOverlay();
+  }
+
+  material.uniforms.time.value = clock.getElapsedTime();
+  material.uniforms.uMode.value = effectModeRef === 'xray' ? 1 : 0;
+  material.uniforms.resolution.value.set(hiddenVideo.videoWidth || 1280, hiddenVideo.videoHeight || 720);
+  updateGeometry();
+  renderer.render(scene, camera);
+}
+
+async function init(){
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 1280, height: 720, facingMode: 'user' },
+      audio: false,
+    });
+  } catch (err) {
+    showError('Camera access is required for the X-Ray Hand Tracker to work. Please allow camera permissions and reload.');
+    return;
+  }
+
+  hiddenVideo.srcObject = stream;
+  bgVideo.srcObject = stream;
+
+  await new Promise(resolve => {
+    hiddenVideo.onloadedmetadata = () => resolve();
+  });
+  await hiddenVideo.play();
+  await bgVideo.play();
+
+  videoAspect = (hiddenVideo.videoWidth && hiddenVideo.videoHeight)
+    ? hiddenVideo.videoWidth / hiddenVideo.videoHeight
+    : 16 / 9;
+
+  try {
+    const vision = await FilesetResolver.forVisionTasks(
+      'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm'
+    );
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+        delegate: 'GPU',
+      },
+      runningMode: 'VIDEO',
+      numHands: 2,
+    });
+  } catch (err) {
+    showError('Could not load the hand-tracking model. Check your connection and reload the page.');
+    return;
+  }
+
+  initThree();
+  loading.classList.add('hidden');
+  detectLoop();
+}
+
+window.addEventListener('resize', handleResize);
+window.addEventListener('beforeunload', () => {
+  if (rafId) cancelAnimationFrame(rafId);
+  if (handLandmarker) handLandmarker.close();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  hiddenVideo.srcObject = null;
+  bgVideo.srcObject = null;
+});
+
+init();
+</script>
+</body>
+</html>
